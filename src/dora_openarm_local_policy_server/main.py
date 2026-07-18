@@ -26,6 +26,11 @@ import tempfile
 import threading
 import time
 
+from dora_openarm_local_policy_server.shm_ring import (
+    SHM_RING_TRANSPORT,
+    SharedMemoryRingWriter,
+)
+
 
 START_COMMANDS = {"start"}
 STOP_COMMANDS = {"stop", "intervene", "quit"}
@@ -45,12 +50,15 @@ class _PreparedRequest:
     event_ns: int
     ready_ns: int
     event_period_ms: float | None
-    prepare_arrow_ms: float
+    prepare_input_ms: float
     json_request_ms: float
     path: str
     reset: bool
     generation: int
     should_log_timing: bool
+    transport: str = "arrow_file"
+    resource: tuple | None = None
+    payload_bytes: int = 0
 
 
 @dataclass
@@ -148,7 +156,16 @@ def _update_observation_generation(observation, state):
     return state["generation"]
 
 
-def _prepare_request(event, state, arrow_pool, generation, protected_paths=()):
+def _prepare_request(
+    event,
+    state,
+    arrow_pool,
+    generation,
+    protected_resources=(),
+    *,
+    transport="arrow_file",
+    shm_writer=None,
+):
     event_ns = time.perf_counter_ns()
     event_period_ms = (
         None
@@ -159,24 +176,50 @@ def _prepare_request(event, state, arrow_pool, generation, protected_paths=()):
     state["timing_index"] += 1
 
     prepare_start_ns = time.perf_counter_ns()
-    path = arrow_pool.reserve_path(protected_paths)
-    record_batch = pa.RecordBatch.from_struct_array(event["value"])
-    with pa.output_stream(path) as output:
-        with pa.ipc.new_file(output, record_batch.schema) as writer:
-            writer.write(record_batch)
-    ready_ns = time.perf_counter_ns()
-
-    return _PreparedRequest(
-        request={
+    if transport == SHM_RING_TRANSPORT:
+        if shm_writer is None:
+            raise ValueError("shm_writer is required for shm_ring transport")
+        result = shm_writer.write(
+            event["value"],
+            event["metadata"],
+            protected_resources,
+        )
+        path = result.descriptor["path"]
+        resource = result.resource
+        payload_bytes = result.bytes_written
+        request = {
+            "name": "inference",
+            "transport": SHM_RING_TRANSPORT,
+            "shm": result.descriptor,
+            "metadata": event["metadata"],
+        }
+    else:
+        protected_paths = {
+            resource[1]
+            for resource in protected_resources
+            if resource and resource[0] == "arrow_file"
+        }
+        path = arrow_pool.reserve_path(protected_paths)
+        record_batch = pa.RecordBatch.from_struct_array(event["value"])
+        with pa.output_stream(path) as output:
+            with pa.ipc.new_file(output, record_batch.schema) as writer:
+                writer.write(record_batch)
+        resource = ("arrow_file", path, None)
+        payload_bytes = os.path.getsize(path)
+        request = {
             "name": "inference",
             "data_path": path,
             "metadata": event["metadata"],
-        },
+        }
+    ready_ns = time.perf_counter_ns()
+
+    return _PreparedRequest(
+        request=request,
         request_json="",
         event_ns=event_ns,
         ready_ns=ready_ns,
         event_period_ms=event_period_ms,
-        prepare_arrow_ms=(ready_ns - prepare_start_ns) / 1e6,
+        prepare_input_ms=(ready_ns - prepare_start_ns) / 1e6,
         json_request_ms=0.0,
         path=path,
         reset=False,
@@ -185,6 +228,9 @@ def _prepare_request(event, state, arrow_pool, generation, protected_paths=()):
             state["timing_every"] > 0
             and state["timing_index"] % state["timing_every"] == 0
         ),
+        transport=transport,
+        resource=resource,
+        payload_bytes=payload_bytes,
     )
 
 
@@ -210,6 +256,23 @@ def _send_actions(node, actions, reset):
     return True
 
 
+def _response_acknowledges_reset(actions):
+    """Return whether a completed response confirms request-side reset delivery."""
+    return bool(actions.get("reset_applied") or actions.get("positions"))
+
+
+def _validate_input_ack(prepared, actions):
+    """Ensure a ring response acknowledges the slot sequence being released."""
+    if prepared.transport != SHM_RING_TRANSPORT:
+        return
+    expected = prepared.request["shm"]["sequence"]
+    actual = actions.get("input_sequence")
+    if actual != expected:
+        raise RuntimeError(
+            f"Policy server acknowledged input sequence {actual!r}, expected {expected}"
+        )
+
+
 def _print_local_timing(
     *,
     mode,
@@ -228,13 +291,15 @@ def _print_local_timing(
     print(
         "[local-policy timing] "
         f"mode={mode} "
+        f"transport={prepared.transport} "
         f"loop={(t_loop_done_ns - prepared.event_ns) / 1e6:.2f}ms "
         f"event_period={_format_ms(prepared.event_period_ms)} "
         f"request_period={_format_ms(request_period_ms)} "
         f"next_request_wait={_format_ms(next_request_wait_ms)} "
         f"event_to_send={(t_send_start_ns - prepared.event_ns) / 1e6:.2f}ms "
         f"queued={(t_send_start_ns - prepared.ready_ns) / 1e6:.2f}ms "
-        f"prepare_arrow={prepared.prepare_arrow_ms:.2f}ms "
+        f"prepare_input={prepared.prepare_input_ms:.2f}ms "
+        f"payload={prepared.payload_bytes / (1024 * 1024):.2f}MiB "
         f"json_request={prepared.json_request_ms:.2f}ms "
         f"write_flush={(t_request_sent_ns - t_send_start_ns) / 1e6:.2f}ms "
         f"response_wait={(t_response_done_ns - t_request_sent_ns) / 1e6:.2f}ms "
@@ -246,17 +311,23 @@ def _print_local_timing(
         f"dropped_stale={int(dropped_stale)} "
         f"server_policy={_format_ms(timing.get('policy_ms'))} "
         f"server_ready={_format_ms(timing.get('response_ready_ms'))} "
-        f"server_arrow={_format_ms(timing.get('arrow_read_ms'))} "
-        f"server_parse={_format_ms(timing.get('parse_observations_ms'))} "
+        f"server_input={_format_ms(timing.get('input_read_ms', timing.get('arrow_read_ms')))} "
+        f"server_parse={_format_ms(timing.get('input_parse_ms', timing.get('parse_observations_ms')))} "
+        f"server_rate_wait={_format_ms(timing.get('rate_limit_wait_ms'))} "
+        f"server_transport={timing.get('input_transport', 'arrow_file')} "
         f"server_mmap={timing.get('arrow_memory_map', 'NA')}",
         flush=True,
     )
 
 
-def _main_dora(io, shared_dir):
+def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
     n_keep_data = 5  # TODO: Customizable?
     timing_every = max(0, _env_int("LOCAL_POLICY_TIMING_EVERY", 20))
-    arrow_pool_size = max(0, _env_int("LOCAL_POLICY_ARROW_POOL_SIZE", 0))
+    arrow_pool_size = (
+        max(0, _env_int("LOCAL_POLICY_ARROW_POOL_SIZE", 0))
+        if transport == "arrow_file"
+        else 0
+    )
     arrow_pool = _ArrowFilePool(shared_dir, arrow_pool_size)
     state = _new_prepare_state()
     state["timing_every"] = timing_every
@@ -267,7 +338,7 @@ def _main_dora(io, shared_dir):
         "latest": None,
         "reader_done": False,
         "error": None,
-        "in_flight_path": None,
+        "in_flight_resource": None,
         "active": False,
         "generation": 0,
     }
@@ -305,8 +376,8 @@ def _main_dora(io, shared_dir):
                     shared["generation"] = generation
                     latest = shared["latest"]
                     protected = {
-                        shared["in_flight_path"],
-                        latest.path if latest is not None else None,
+                        shared["in_flight_resource"],
+                        latest.resource if latest is not None else None,
                     }
 
                 prepared = _prepare_request(
@@ -315,6 +386,8 @@ def _main_dora(io, shared_dir):
                     arrow_pool,
                     generation,
                     protected,
+                    transport=transport,
+                    shm_writer=shm_writer,
                 )
                 with cond:
                     if shared["active"] and shared["generation"] == generation:
@@ -355,7 +428,7 @@ def _main_dora(io, shared_dir):
                 break
             prepared = shared["latest"]
             shared["latest"] = None
-            shared["in_flight_path"] = prepared.path
+            shared["in_flight_resource"] = prepared.resource
         wait_done_ns = time.perf_counter_ns()
 
         _serialize_request(
@@ -372,7 +445,6 @@ def _main_dora(io, shared_dir):
         io.flush()
         request_sent_ns = time.perf_counter_ns()
         last_request_sent_ns = request_sent_ns
-        request_reset.consume(prepared.generation)
 
         response = io.readline()
         response_done_ns = time.perf_counter_ns()
@@ -380,11 +452,13 @@ def _main_dora(io, shared_dir):
             break
         actions = json.loads(response)
         response_parsed_ns = time.perf_counter_ns()
+        _validate_input_ack(prepared, actions)
+        if prepared.reset and _response_acknowledges_reset(actions):
+            request_reset.consume(prepared.generation)
 
         with cond:
             dropped_stale = (
-                not shared["active"]
-                or shared["generation"] != prepared.generation
+                not shared["active"] or shared["generation"] != prepared.generation
             )
         if not dropped_stale and _send_actions(
             node,
@@ -395,14 +469,19 @@ def _main_dora(io, shared_dir):
         loop_done_ns = time.perf_counter_ns()
 
         with cond:
-            if shared["in_flight_path"] == prepared.path:
-                shared["in_flight_path"] = None
+            if shared["in_flight_resource"] == prepared.resource:
+                shared["in_flight_resource"] = None
             latest = shared["latest"]
             protected = {
-                shared["in_flight_path"],
-                latest.path if latest is not None else None,
+                shared["in_flight_resource"],
+                latest.resource if latest is not None else None,
             }
-        arrow_pool.prune_extra(n_keep_data, protected)
+        protected_paths = {
+            resource[1]
+            for resource in protected
+            if resource and resource[0] == "arrow_file"
+        }
+        arrow_pool.prune_extra(n_keep_data, protected_paths)
 
         if prepared.should_log_timing:
             _print_local_timing(
@@ -432,14 +511,37 @@ def main():
         type=str,
     )
     args = parser.parse_args()
+    transport = os.getenv("LOCAL_POLICY_TRANSPORT", "arrow_file").strip().lower()
+    if transport == "shm_ring":
+        transport = SHM_RING_TRANSPORT
+    if transport not in {"arrow_file", SHM_RING_TRANSPORT}:
+        raise ValueError(
+            "LOCAL_POLICY_TRANSPORT must be 'arrow_file' or 'shm_ring', "
+            f"got {transport!r}"
+        )
 
     with tempfile.TemporaryDirectory(
         prefix="dora-openarm-local-policy-server", dir="/dev/shm"
     ) as shared_dir:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(args.socket)
-            with sock.makefile("rw") as io:
-                _main_dora(io, shared_dir)
+        shm_writer = (
+            SharedMemoryRingWriter(shared_dir)
+            if transport == SHM_RING_TRANSPORT
+            else None
+        )
+        print(f"Local policy input transport: {transport}", flush=True)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(args.socket)
+                with sock.makefile("rw") as io:
+                    _main_dora(
+                        io,
+                        shared_dir,
+                        transport=transport,
+                        shm_writer=shm_writer,
+                    )
+        finally:
+            if shm_writer is not None:
+                shm_writer.close()
 
 
 if __name__ == "__main__":
