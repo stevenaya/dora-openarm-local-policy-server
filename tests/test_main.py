@@ -136,11 +136,16 @@ def test_output_reset_is_consumed_only_after_nonempty_actions():
     assert latch.pending(1)
     assert node.outputs == []
 
-    actions = {"interval": 1, "positions": [[1.0, 2.0]]}
+    actions = {
+        "interval": 1,
+        "positions": [[1.0, 2.0]],
+        "metadata": {"chunk_id": "chunk-1"},
+    }
     if _send_actions(node, actions, latch.pending(1)):
         latch.consume(1)
     assert not latch.pending(1)
     assert node.outputs[0][2]["reset"] is True
+    assert node.outputs[0][2]["chunk_id"] == "chunk-1"
 
 
 def test_shm_ring_slot_is_released_only_after_matching_ack():

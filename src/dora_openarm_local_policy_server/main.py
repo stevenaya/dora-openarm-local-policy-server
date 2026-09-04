@@ -245,7 +245,8 @@ def _serialize_request(prepared, reset):
 def _send_actions(node, actions, reset):
     if not actions["positions"]:
         return False
-    metadata = {"interval": actions["interval"], "reset": reset}
+    metadata = dict(actions.get("metadata", {}))
+    metadata.update({"interval": actions["interval"], "reset": reset})
     if "cutoff_hz" in actions:
         metadata["cutoff_hz"] = actions["cutoff_hz"]
     node.send_output(
