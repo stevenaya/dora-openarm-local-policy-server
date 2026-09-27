@@ -246,7 +246,7 @@ def _send_actions(node, actions, reset):
     if not actions["positions"]:
         return False
     metadata = dict(actions.get("metadata", {}))
-    metadata.update({"interval": actions["interval"], "reset": reset})
+    metadata.update({"interval": actions["interval"], "reset": reset or bool(metadata.get("reset"))})
     if "cutoff_hz" in actions:
         metadata["cutoff_hz"] = actions["cutoff_hz"]
     node.send_output(
