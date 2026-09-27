@@ -1,5 +1,22 @@
 # Parallel Shared-Memory Local Policy Bridge
 
+## Readiness
+
+The node joins Dora before connecting to the model and publishes `status` values
+`loading`, `ready`, or `error`, with Unix-nanosecond `timestamp` and `message`.
+While loading, Start and observations are ignored. Startup waits up to
+`POLICY_START_TIMEOUT_SEC` (default 600 seconds), then uses the inference
+connection to send `{"ping": true}` and requires `{"ready": true}`. The model
+must finish configured warmup before acknowledging; socket-file existence alone
+is not readiness. A failed handshake or request/response failure reports
+`error`. There is no idle socket polling: an idle disconnect is detected on the
+next request. There is no automatic reconnect or replay.
+
+Declare `status` alongside `actions` in the dataflow and connect it to the UI's
+`policy_status` input with `WAIT_FOR_POLICY_READY=true`. UI-only/collection flows
+without a policy can retain their existing behavior. The receiver runs while
+waiting for startup, so early Start commands do not become active later.
+
 ## Scope
 
 This document describes the `dora-openarm-local-policy-server` Dora node: how it
@@ -233,6 +250,7 @@ not need dedicated forwarding code in this node.
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `SOCKET` / `--socket` | none | Unix socket exposed by the policy process. |
+| `POLICY_START_TIMEOUT_SEC` | `600` | Deadline for connection and ready handshake. |
 | `LOCAL_POLICY_TRANSPORT` | `arrow_file` | `arrow_file`, `shm_ring`, or `shm_ring_v1`. |
 | `LOCAL_POLICY_TIMING_EVERY` | `20` | Print timing every N observations; `0` disables it. |
 | `LOCAL_POLICY_ARROW_POOL_SIZE` | `0` | Reusable files in Arrow compatibility mode. |
@@ -252,10 +270,12 @@ Example Dora configuration:
     command: evaluation-ui/arm_command
   outputs:
     - actions
+    - status
 ```
 
-Start the listening policy process before this Dora node. If it runs in a
-container, mount host `/dev/shm` at `/dev/shm` in the container so both the Unix
+The policy may still be loading when this node starts; the bridge waits for its
+readiness handshake. If the model runs in a container, mount host `/dev/shm`
+at `/dev/shm` in the container so both the Unix
 socket and ring path refer to the same namespace.
 
 ## Timing and Diagnosis

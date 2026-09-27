@@ -321,8 +321,46 @@ def _print_local_timing(
     )
 
 
-def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
-    n_keep_data = 5  # TODO: Customizable?
+def _send_status(node, value, message=""):
+    node.send_output(
+        "status", pa.array([value]), {"timestamp": time.time_ns(), "message": message}
+    )
+
+
+@contextlib.contextmanager
+def _connect_ready(sock, path, timeout, stopped):
+    """Wait for warmup and handshake on the connection used for inference."""
+    deadline = time.monotonic() + timeout
+    while not stopped.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Policy startup timed out after {timeout}s: {path}")
+        sock.settimeout(remaining)
+        try:
+            sock.connect(path)
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            stopped.wait(min(0.1, remaining))
+    else:
+        raise InterruptedError("Policy startup cancelled")
+    with sock.makefile("rw") as io:
+        io.write('{"ping": true}\n')
+        io.flush()
+        response = io.readline()
+        if not response:
+            raise ConnectionError("Policy server closed the readiness handshake")
+        reply = json.loads(response)
+        if reply.get("ready") is not True:
+            raise RuntimeError(
+                reply.get("error") or "Policy server did not acknowledge ready"
+            )
+        sock.settimeout(None)
+        yield io
+
+
+def _main_dora(
+    sock, shared_dir, *, socket_path, transport="arrow_file", shm_writer=None
+):
     timing_every = max(0, _env_int("LOCAL_POLICY_TIMING_EVERY", 20))
     arrow_pool_size = (
         max(0, _env_int("LOCAL_POLICY_ARROW_POOL_SIZE", 0))
@@ -335,18 +373,28 @@ def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
 
     node = dora.Node()
     cond = threading.Condition()
+    stopped = threading.Event()
     shared = {
         "latest": None,
-        "reader_done": False,
         "error": None,
         "in_flight_resource": None,
         "active": False,
+        "ready": False,
         "generation": 0,
     }
 
     def reader_loop():
         try:
-            for event in node:
+            while not stopped.is_set():
+                event = node.next(timeout=0.1)
+                if event is None or event["type"] == "STOP":
+                    break
+                if event["type"] == "ERROR":
+                    if str(event["error"]).startswith("Timeout"):
+                        continue
+                    raise RuntimeError(event["error"])
+                if event["type"] == "INPUT_CLOSED" and event["id"] == "observation":
+                    break
                 if event["type"] != "INPUT":
                     continue
 
@@ -355,6 +403,8 @@ def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
                     command = event["value"][0].as_py()
                     with cond:
                         if command in START_COMMANDS:
+                            if not shared["ready"]:
+                                continue
                             shared["generation"] = _start_episode(state)
                             shared["active"] = True
                             shared["latest"] = None
@@ -397,19 +447,47 @@ def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
         except BaseException as exc:
             with cond:
                 shared["error"] = exc
-                shared["reader_done"] = True
-                cond.notify()
-        else:
+        finally:
             with cond:
-                shared["reader_done"] = True
-                cond.notify()
+                stopped.set()
+                shared["active"] = False
+                shared["latest"] = None
+                cond.notify_all()
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
 
     reader = threading.Thread(
         target=reader_loop,
         name="local-policy-observation-reader",
         daemon=True,
     )
+    _send_status(node, "loading")
     reader.start()
+    try:
+        timeout = _env_int("POLICY_START_TIMEOUT_SEC", 600)
+        with _connect_ready(sock, socket_path, timeout, stopped) as io:
+            with cond:
+                if shared["error"] is not None:
+                    raise shared["error"]
+                if stopped.is_set():
+                    return
+                shared["ready"] = True
+                _send_status(node, "ready")
+            _run_requests(node, io, cond, shared, stopped, arrow_pool)
+    except Exception as exc:
+        error = shared["error"]
+        if stopped.is_set() and error is None:
+            return  # Normal shutdown can interrupt connect/readline.
+        error = error or exc
+        _send_status(node, "error", str(error))
+        raise error
+    finally:
+        stopped.set()
+        reader.join()
+
+
+def _run_requests(node, io, cond, shared, stopped, arrow_pool):
+    n_keep_data = 5
 
     request_reset = _ResetLatch()
     output_reset = _ResetLatch()
@@ -417,15 +495,11 @@ def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
     while True:
         wait_start_ns = time.perf_counter_ns()
         with cond:
-            while (
-                shared["latest"] is None
-                and not shared["reader_done"]
-                and shared["error"] is None
-            ):
+            while shared["latest"] is None and not stopped.is_set():
                 cond.wait()
             if shared["error"] is not None:
                 raise shared["error"]
-            if shared["latest"] is None and shared["reader_done"]:
+            if stopped.is_set():
                 break
             prepared = shared["latest"]
             shared["latest"] = None
@@ -450,8 +524,10 @@ def _main_dora(io, shared_dir, *, transport="arrow_file", shm_writer=None):
         response = io.readline()
         response_done_ns = time.perf_counter_ns()
         if not response:
-            break
+            raise ConnectionError("Policy server disconnected")
         actions = json.loads(response)
+        if actions.get("error"):
+            raise RuntimeError(actions["error"])
         response_parsed_ns = time.perf_counter_ns()
         _validate_input_ack(prepared, actions)
         if prepared.reset and _response_acknowledges_reset(actions):
@@ -532,14 +608,13 @@ def main():
         print(f"Local policy input transport: {transport}", flush=True)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.connect(args.socket)
-                with sock.makefile("rw") as io:
-                    _main_dora(
-                        io,
-                        shared_dir,
-                        transport=transport,
-                        shm_writer=shm_writer,
-                    )
+                _main_dora(
+                    sock,
+                    shared_dir,
+                    socket_path=args.socket,
+                    transport=transport,
+                    shm_writer=shm_writer,
+                )
         finally:
             if shm_writer is not None:
                 shm_writer.close()
