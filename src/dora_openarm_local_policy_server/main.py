@@ -15,108 +15,566 @@
 """Node to communicate with a local policy server."""
 
 import argparse
+import contextlib
+from dataclasses import dataclass
 import dora
 import json
 import os
 import pyarrow as pa
 import socket
 import tempfile
+import threading
+import time
+
+from dora_openarm_local_policy_server.shm_ring import (
+    SHM_RING_TRANSPORT,
+    SharedMemoryRingWriter,
+)
 
 
-def _main_dora(io, shared_dir):
-    n_keep_data = 5  # TODO: Customizable?
-    data_files = []
+START_COMMANDS = {"start"}
+STOP_COMMANDS = {"stop", "intervene", "quit"}
 
-    node = dora.Node()
-    previous_observation_id = None
-    for event in node:
-        if event["type"] != "INPUT":
-            continue
 
-        # Main process
-        def prepare_request():
-            nonlocal previous_observation_id
-            observation = event["value"]
-            observation_id = observation.field("id")[0].as_py()
-            # The observation id increments per observation and drops back to a
-            # lower value when a new episode starts, so a decrease (or the very
-            # first observation) signals a reset to the policy server.
-            reset = (
-                previous_observation_id is None
-                or observation_id < previous_observation_id
+def _env_int(name, default):
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+@dataclass
+class _PreparedRequest:
+    request: dict
+    request_json: str
+    event_ns: int
+    ready_ns: int
+    event_period_ms: float | None
+    prepare_input_ms: float
+    json_request_ms: float
+    path: str
+    reset: bool
+    generation: int
+    should_log_timing: bool
+    transport: str = "arrow_file"
+    resource: tuple | None = None
+    payload_bytes: int = 0
+
+
+@dataclass
+class _ResetLatch:
+    last_generation: int = 0
+
+    def pending(self, generation):
+        return generation != self.last_generation
+
+    def consume(self, generation):
+        self.last_generation = generation
+
+
+class _ArrowFilePool:
+    def __init__(self, shared_dir, pool_size):
+        self.shared_dir = shared_dir
+        self.paths = []
+        self.extra_paths = []
+        self.next_index = 0
+        for _ in range(max(0, int(pool_size))):
+            fp = tempfile.NamedTemporaryFile(
+                suffix=".arrow",
+                dir=shared_dir,
+                delete=False,
             )
-            previous_observation_id = observation_id
-            data_file = tempfile.NamedTemporaryFile(
-                suffix=".arrow", dir=shared_dir, delete_on_close=False
-            )
-            record_batch = pa.RecordBatch.from_struct_array(observation)
-            with pa.output_stream(data_file) as output:
-                with pa.ipc.new_file(output, record_batch.schema) as writer:
-                    writer.write(record_batch)
-            data_files.append(data_file)
-            if len(data_files) > n_keep_data:
-                data_files.pop(0)
-            return {
-                "name": "inference",
-                "data_path": data_file.name,
-                "reset": reset,
-                "metadata": event["metadata"],
-            }
+            fp.close()
+            self.paths.append(fp.name)
 
-        # dora-rs node -> Policy server: Inference request
-        #   {"name": "inference", "data_path": "/data/path.arrow",
-        #    "reset": true/false, ...}
-        #
-        # "/data/path.arrow" has a record batch:
-        #   {
-        #     # element len: 8 (7 joints + 1 gripper) * 2 (right + left)
-        #     # "arm_right" + "arm_left"
-        #     "position": pa.list_(pa.float32()),
-        #     # element len: 600 (height) * 960 (width) * 3 (RGB)
-        #     # element shape: (height, width, color)
-        #     "camera_wrist_right": pa.list_(pa.uint8()),
-        #     # element len: 600 (height) * 960 (width) * 3 (RGB)
-        #     # element shape: (height, width, color)
-        #     "camera_wrist_left": pa.list_(pa.uint8()),
-        #     # element len: 600 (height) * 960 (width) * 3 (RGB)
-        #     # element shape: (height, width, color)
-        #     "camera_head": pa.list_(pa.uint8()),
-        #     # element len: 600 (height) * 960 (width) * 3 (RGB)
-        #     # element shape: (height, width, color)
-        #     "camera_ceiling": pa.list_(pa.uint8()),
-        #     }
-        #   }
-        request = prepare_request()
-        io.write(json.dumps(request) + "\n")
+    @property
+    def enabled(self):
+        return bool(self.paths)
+
+    def reserve_path(self, protected_paths=()):
+        protected = {path for path in protected_paths if path}
+        for _ in range(len(self.paths)):
+            path = self.paths[self.next_index]
+            self.next_index = (self.next_index + 1) % len(self.paths)
+            if path not in protected:
+                return path
+
+        fp = tempfile.NamedTemporaryFile(
+            suffix=".arrow",
+            dir=self.shared_dir,
+            delete=False,
+        )
+        fp.close()
+        self.extra_paths.append(fp.name)
+        return fp.name
+
+    def prune_extra(self, keep, protected_paths=()):
+        if not self.extra_paths:
+            return
+        protected = {path for path in protected_paths if path}
+        removable = max(0, len(self.extra_paths) - int(keep))
+        if removable <= 0:
+            return
+        kept = []
+        for path in self.extra_paths:
+            if removable > 0 and path not in protected:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+                removable -= 1
+            else:
+                kept.append(path)
+        self.extra_paths = kept
+
+
+def _format_ms(value):
+    return "NA" if value is None else f"{value:.2f}ms"
+
+
+def _new_prepare_state():
+    return {
+        "previous_observation_id": None,
+        "last_event_ns": None,
+        "timing_index": 0,
+        "generation": 0,
+    }
+
+
+def _start_episode(state):
+    state["generation"] += 1
+    state["previous_observation_id"] = None
+    return state["generation"]
+
+
+def _update_observation_generation(observation, state):
+    observation_id = max(observation.field("id").to_pylist())
+    previous_id = state["previous_observation_id"]
+    if state["generation"] == 0 or (
+        previous_id is not None and observation_id < previous_id
+    ):
+        _start_episode(state)
+    state["previous_observation_id"] = observation_id
+    return state["generation"]
+
+
+def _prepare_request(
+    event,
+    state,
+    arrow_pool,
+    generation,
+    protected_resources=(),
+    *,
+    transport="arrow_file",
+    shm_writer=None,
+):
+    event_ns = time.perf_counter_ns()
+    event_period_ms = (
+        None
+        if state["last_event_ns"] is None
+        else (event_ns - state["last_event_ns"]) / 1e6
+    )
+    state["last_event_ns"] = event_ns
+    state["timing_index"] += 1
+
+    prepare_start_ns = time.perf_counter_ns()
+    if transport == SHM_RING_TRANSPORT:
+        if shm_writer is None:
+            raise ValueError("shm_writer is required for shm_ring transport")
+        result = shm_writer.write(
+            event["value"],
+            event["metadata"],
+            protected_resources,
+        )
+        path = result.descriptor["path"]
+        resource = result.resource
+        payload_bytes = result.bytes_written
+        request = {
+            "name": "inference",
+            "transport": SHM_RING_TRANSPORT,
+            "shm": result.descriptor,
+            "metadata": event["metadata"],
+        }
+    else:
+        protected_paths = {
+            resource[1]
+            for resource in protected_resources
+            if resource and resource[0] == "arrow_file"
+        }
+        path = arrow_pool.reserve_path(protected_paths)
+        record_batch = pa.RecordBatch.from_struct_array(event["value"])
+        with pa.output_stream(path) as output:
+            with pa.ipc.new_file(output, record_batch.schema) as writer:
+                writer.write(record_batch)
+        resource = ("arrow_file", path, None)
+        payload_bytes = os.path.getsize(path)
+        request = {
+            "name": "inference",
+            "data_path": path,
+            "metadata": event["metadata"],
+        }
+    ready_ns = time.perf_counter_ns()
+
+    return _PreparedRequest(
+        request=request,
+        request_json="",
+        event_ns=event_ns,
+        ready_ns=ready_ns,
+        event_period_ms=event_period_ms,
+        prepare_input_ms=(ready_ns - prepare_start_ns) / 1e6,
+        json_request_ms=0.0,
+        path=path,
+        reset=False,
+        generation=generation,
+        should_log_timing=(
+            state["timing_every"] > 0
+            and state["timing_index"] % state["timing_every"] == 0
+        ),
+        transport=transport,
+        resource=resource,
+        payload_bytes=payload_bytes,
+    )
+
+
+def _serialize_request(prepared, reset):
+    start_ns = time.perf_counter_ns()
+    prepared.reset = reset
+    prepared.request["reset"] = reset
+    prepared.request_json = json.dumps(prepared.request)
+    prepared.json_request_ms = (time.perf_counter_ns() - start_ns) / 1e6
+
+
+def _send_actions(node, actions, reset):
+    if not actions["positions"]:
+        return False
+    metadata = dict(actions.get("metadata", {}))
+    metadata.update(
+        {"interval": actions["interval"], "reset": reset or bool(metadata.get("reset"))}
+    )
+    if "cutoff_hz" in actions:
+        metadata["cutoff_hz"] = actions["cutoff_hz"]
+    node.send_output(
+        "actions",
+        pa.array(actions["positions"], type=pa.list_(pa.float32())),
+        metadata,
+    )
+    return True
+
+
+def _response_acknowledges_reset(actions):
+    """Return whether a completed response confirms request-side reset delivery."""
+    return bool(actions.get("reset_applied") or actions.get("positions"))
+
+
+def _validate_input_ack(prepared, actions):
+    """Ensure a ring response acknowledges the slot sequence being released."""
+    if prepared.transport != SHM_RING_TRANSPORT:
+        return
+    expected = prepared.request["shm"]["sequence"]
+    actual = actions.get("input_sequence")
+    if actual != expected:
+        raise RuntimeError(
+            f"Policy server acknowledged input sequence {actual!r}, expected {expected}"
+        )
+
+
+def _print_local_timing(
+    *,
+    mode,
+    prepared,
+    t_send_start_ns,
+    t_request_sent_ns,
+    t_response_done_ns,
+    t_response_parsed_ns,
+    t_loop_done_ns,
+    actions,
+    request_period_ms=None,
+    next_request_wait_ms=None,
+    dropped_stale=False,
+):
+    timing = actions.get("timing") or {}
+    print(
+        "[local-policy timing] "
+        f"mode={mode} "
+        f"transport={prepared.transport} "
+        f"loop={(t_loop_done_ns - prepared.event_ns) / 1e6:.2f}ms "
+        f"event_period={_format_ms(prepared.event_period_ms)} "
+        f"request_period={_format_ms(request_period_ms)} "
+        f"next_request_wait={_format_ms(next_request_wait_ms)} "
+        f"event_to_send={(t_send_start_ns - prepared.event_ns) / 1e6:.2f}ms "
+        f"queued={(t_send_start_ns - prepared.ready_ns) / 1e6:.2f}ms "
+        f"prepare_input={prepared.prepare_input_ms:.2f}ms "
+        f"payload={prepared.payload_bytes / (1024 * 1024):.2f}MiB "
+        f"json_request={prepared.json_request_ms:.2f}ms "
+        f"write_flush={(t_request_sent_ns - t_send_start_ns) / 1e6:.2f}ms "
+        f"response_wait={(t_response_done_ns - t_request_sent_ns) / 1e6:.2f}ms "
+        f"socket_rtt={(t_response_done_ns - t_send_start_ns) / 1e6:.2f}ms "
+        f"json_response={(t_response_parsed_ns - t_response_done_ns) / 1e6:.2f}ms "
+        f"send_output={(t_loop_done_ns - t_response_parsed_ns) / 1e6:.2f}ms "
+        f"positions={len(actions.get('positions') or [])} "
+        f"reset={prepared.reset} "
+        f"dropped_stale={int(dropped_stale)} "
+        f"server_policy={_format_ms(timing.get('policy_ms'))} "
+        f"server_ready={_format_ms(timing.get('response_ready_ms'))} "
+        f"server_input={_format_ms(timing.get('input_read_ms', timing.get('arrow_read_ms')))} "
+        f"server_parse={_format_ms(timing.get('input_parse_ms', timing.get('parse_observations_ms')))} "
+        f"server_rate_wait={_format_ms(timing.get('rate_limit_wait_ms'))} "
+        f"server_transport={timing.get('input_transport', 'arrow_file')} "
+        f"server_mmap={timing.get('arrow_memory_map', 'NA')}",
+        flush=True,
+    )
+
+
+def _send_status(node, value, message=""):
+    node.send_output(
+        "status", pa.array([value]), {"timestamp": time.time_ns(), "message": message}
+    )
+
+
+@contextlib.contextmanager
+def _connect_ready(sock, path, timeout, stopped):
+    """Wait for warmup and handshake on the connection used for inference."""
+    deadline = time.monotonic() + timeout
+    while not stopped.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Policy startup timed out after {timeout}s: {path}")
+        sock.settimeout(remaining)
+        try:
+            sock.connect(path)
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            stopped.wait(min(0.1, remaining))
+    else:
+        raise InterruptedError("Policy startup cancelled")
+    with sock.makefile("rw") as io:
+        io.write('{"ping": true}\n')
         io.flush()
-
-        # Policy server -> dora-rs node: Inferred actions
-        #   {
-        #     "interval": interval_in_ns,
-        #     "positions": [
-        #        [...],
-        #        ...
-        #     ]
-        #   }
-        #
-        #   Arm position: Motor positions
-        #     Bimanual: 8 (7 joints + 1 gripper) * 2 (right + left)
-        #     Unimanual: 8 (7 joints + 1 gripper)
         response = io.readline()
         if not response:
-            break
+            raise ConnectionError("Policy server closed the readiness handshake")
+        reply = json.loads(response)
+        if reply.get("ready") is not True:
+            raise RuntimeError(
+                reply.get("error") or "Policy server did not acknowledge ready"
+            )
+        sock.settimeout(None)
+        yield io
+
+
+def _main_dora(
+    sock, shared_dir, *, socket_path, transport="arrow_file", shm_writer=None
+):
+    timing_every = max(0, _env_int("LOCAL_POLICY_TIMING_EVERY", 20))
+    arrow_pool_size = (
+        max(0, _env_int("LOCAL_POLICY_ARROW_POOL_SIZE", 0))
+        if transport == "arrow_file"
+        else 0
+    )
+    arrow_pool = _ArrowFilePool(shared_dir, arrow_pool_size)
+    state = _new_prepare_state()
+    state["timing_every"] = timing_every
+
+    node = dora.Node()
+    cond = threading.Condition()
+    stopped = threading.Event()
+    shared = {
+        "latest": None,
+        "error": None,
+        "in_flight_resource": None,
+        "active": False,
+        "ready": False,
+        "generation": 0,
+    }
+
+    def reader_loop():
+        try:
+            while not stopped.is_set():
+                event = node.next(timeout=0.1)
+                if event is None or event["type"] == "STOP":
+                    break
+                if event["type"] == "ERROR":
+                    if str(event["error"]).startswith("Timeout"):
+                        continue
+                    raise RuntimeError(event["error"])
+                if event["type"] == "INPUT_CLOSED" and event["id"] == "observation":
+                    break
+                if event["type"] != "INPUT":
+                    continue
+
+                event_id = event["id"]
+                if event_id == "command":
+                    command = event["value"][0].as_py()
+                    with cond:
+                        if command in START_COMMANDS:
+                            if not shared["ready"]:
+                                continue
+                            shared["generation"] = _start_episode(state)
+                            shared["active"] = True
+                            shared["latest"] = None
+                        elif command in STOP_COMMANDS:
+                            shared["active"] = False
+                            shared["latest"] = None
+                        else:
+                            continue
+                        cond.notify_all()
+                    continue
+
+                if event_id != "observation":
+                    continue
+                with cond:
+                    if not shared["active"]:
+                        continue
+
+                generation = _update_observation_generation(event["value"], state)
+                with cond:
+                    shared["generation"] = generation
+                    latest = shared["latest"]
+                    protected = {
+                        shared["in_flight_resource"],
+                        latest.resource if latest is not None else None,
+                    }
+
+                prepared = _prepare_request(
+                    event,
+                    state,
+                    arrow_pool,
+                    generation,
+                    protected,
+                    transport=transport,
+                    shm_writer=shm_writer,
+                )
+                with cond:
+                    if shared["active"] and shared["generation"] == generation:
+                        shared["latest"] = prepared
+                        cond.notify()
+        except BaseException as exc:
+            with cond:
+                shared["error"] = exc
+        finally:
+            with cond:
+                stopped.set()
+                shared["active"] = False
+                shared["latest"] = None
+                cond.notify_all()
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+    reader = threading.Thread(
+        target=reader_loop,
+        name="local-policy-observation-reader",
+        daemon=True,
+    )
+    _send_status(node, "loading")
+    reader.start()
+    try:
+        timeout = _env_int("POLICY_START_TIMEOUT_SEC", 600)
+        with _connect_ready(sock, socket_path, timeout, stopped) as io:
+            with cond:
+                if shared["error"] is not None:
+                    raise shared["error"]
+                if stopped.is_set():
+                    return
+                shared["ready"] = True
+                _send_status(node, "ready")
+            _run_requests(node, io, cond, shared, stopped, arrow_pool)
+    except Exception as exc:
+        error = shared["error"]
+        if stopped.is_set() and error is None:
+            return  # Normal shutdown can interrupt connect/readline.
+        error = error or exc
+        _send_status(node, "error", str(error))
+        raise error
+    finally:
+        stopped.set()
+        reader.join()
+
+
+def _run_requests(node, io, cond, shared, stopped, arrow_pool):
+    n_keep_data = 5
+
+    request_reset = _ResetLatch()
+    output_reset = _ResetLatch()
+    last_request_sent_ns = None
+    while True:
+        wait_start_ns = time.perf_counter_ns()
+        with cond:
+            while shared["latest"] is None and not stopped.is_set():
+                cond.wait()
+            if shared["error"] is not None:
+                raise shared["error"]
+            if stopped.is_set():
+                break
+            prepared = shared["latest"]
+            shared["latest"] = None
+            shared["in_flight_resource"] = prepared.resource
+        wait_done_ns = time.perf_counter_ns()
+
+        _serialize_request(
+            prepared,
+            request_reset.pending(prepared.generation),
+        )
+        send_start_ns = time.perf_counter_ns()
+        request_period_ms = (
+            None
+            if last_request_sent_ns is None
+            else (send_start_ns - last_request_sent_ns) / 1e6
+        )
+        io.write(prepared.request_json + "\n")
+        io.flush()
+        request_sent_ns = time.perf_counter_ns()
+        last_request_sent_ns = request_sent_ns
+
+        response = io.readline()
+        response_done_ns = time.perf_counter_ns()
+        if not response:
+            raise ConnectionError("Policy server disconnected")
         actions = json.loads(response)
-        if actions["positions"]:
-            # "reset" signals that these actions are the first of a new episode,
-            # so downstream nodes can drop any state carried over from the
-            # previous episode.
-            metadata = {"interval": actions["interval"], "reset": request["reset"]}
-            if "cutoff_hz" in actions:
-                metadata["cutoff_hz"] = actions["cutoff_hz"]
-            node.send_output(
-                "actions",
-                pa.array(actions["positions"], type=pa.list_(pa.float32())),
-                metadata,
+        if actions.get("error"):
+            raise RuntimeError(actions["error"])
+        response_parsed_ns = time.perf_counter_ns()
+        _validate_input_ack(prepared, actions)
+        if prepared.reset and _response_acknowledges_reset(actions):
+            request_reset.consume(prepared.generation)
+
+        with cond:
+            dropped_stale = (
+                not shared["active"] or shared["generation"] != prepared.generation
+            )
+        if not dropped_stale and _send_actions(
+            node,
+            actions,
+            output_reset.pending(prepared.generation),
+        ):
+            output_reset.consume(prepared.generation)
+        loop_done_ns = time.perf_counter_ns()
+
+        with cond:
+            if shared["in_flight_resource"] == prepared.resource:
+                shared["in_flight_resource"] = None
+            latest = shared["latest"]
+            protected = {
+                shared["in_flight_resource"],
+                latest.resource if latest is not None else None,
+            }
+        protected_paths = {
+            resource[1]
+            for resource in protected
+            if resource and resource[0] == "arrow_file"
+        }
+        arrow_pool.prune_extra(n_keep_data, protected_paths)
+
+        if prepared.should_log_timing:
+            _print_local_timing(
+                mode="latest",
+                prepared=prepared,
+                t_send_start_ns=send_start_ns,
+                t_request_sent_ns=request_sent_ns,
+                t_response_done_ns=response_done_ns,
+                t_response_parsed_ns=response_parsed_ns,
+                t_loop_done_ns=loop_done_ns,
+                actions=actions,
+                request_period_ms=request_period_ms,
+                next_request_wait_ms=(wait_done_ns - wait_start_ns) / 1e6,
+                dropped_stale=dropped_stale,
             )
 
 
@@ -132,14 +590,36 @@ def main():
         type=str,
     )
     args = parser.parse_args()
+    transport = os.getenv("LOCAL_POLICY_TRANSPORT", "arrow_file").strip().lower()
+    if transport == "shm_ring":
+        transport = SHM_RING_TRANSPORT
+    if transport not in {"arrow_file", SHM_RING_TRANSPORT}:
+        raise ValueError(
+            "LOCAL_POLICY_TRANSPORT must be 'arrow_file' or 'shm_ring', "
+            f"got {transport!r}"
+        )
 
     with tempfile.TemporaryDirectory(
         prefix="dora-openarm-local-policy-server", dir="/dev/shm"
     ) as shared_dir:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(args.socket)
-            with sock.makefile("rw") as io:
-                _main_dora(io, shared_dir)
+        shm_writer = (
+            SharedMemoryRingWriter(shared_dir)
+            if transport == SHM_RING_TRANSPORT
+            else None
+        )
+        print(f"Local policy input transport: {transport}", flush=True)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                _main_dora(
+                    sock,
+                    shared_dir,
+                    socket_path=args.socket,
+                    transport=transport,
+                    shm_writer=shm_writer,
+                )
+        finally:
+            if shm_writer is not None:
+                shm_writer.close()
 
 
 if __name__ == "__main__":
