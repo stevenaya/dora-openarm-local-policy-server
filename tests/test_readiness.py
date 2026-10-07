@@ -63,6 +63,8 @@ class Node:
                 )
                 # With no accepted Start, the preceding observation must be ignored.
                 self.events.put(command("start"))
+                self.events.put({"type": "INPUT", "id": "execution_plan",
+                                 "value": pa.array([{"chunk_id": "accepted"}]), "metadata": {}})
                 self.events.put(
                     {
                         "type": "INPUT",
@@ -153,6 +155,7 @@ def test_socket_readiness(monkeypatch, tmp_path, mode):
         assert statuses == ["loading", "ready"]
         assert len(requests) == 2 and requests[1]["metadata"]["timestamp"] == 2
         assert requests[1]["reset"]
+        assert requests[1]["execution_plan"] == {"chunk_id": "accepted"}
         assert node.outputs[-1][0] == "actions" and node.outputs[-1][2]["reset"]
     elif mode == "cancel-in-flight":
         assert statuses == ["loading", "ready"]
@@ -183,3 +186,103 @@ def test_startup_timeout_or_cancel(monkeypatch, tmp_path, mode):
             bridge._main_dora(sock, tmp_path, socket_path=str(tmp_path / "absent.sock"))
     expected = ["loading", "error"] if mode == "timeout" else ["loading"]
     assert [v[0].as_py() for n, v, _ in node.outputs if n == "status"] == expected
+
+
+@pytest.mark.parametrize("switch_at", ["in-flight", "waiting-for-adoption"])
+def test_task_switch_unblocks_rtc_and_discards_old_attempt(monkeypatch, tmp_path, switch_at):
+    """A new observation attempt replaces outstanding work or an old ACK wait."""
+    requests, failures = [], []
+
+    def obs(attempt, timestamp):
+        return {"type": "INPUT", "id": "observation", "value": observation(),
+                "metadata": {"timestamp": timestamp, "episode_attempt_id": attempt}}
+
+    def feedback(attempt, chunk):
+        return {"type": "INPUT", "id": "execution_plan",
+                "value": pa.array([{"chunk_id": chunk, "sample_chunk_id": chunk}]),
+                "metadata": {"episode_attempt_id": attempt}}
+
+    class SwitchingNode(Node):
+        def __init__(self):
+            super().__init__("switch")
+            self.switched = threading.Event()
+
+        def next(self, timeout):
+            event = super().next(timeout)
+            if event.get("id") == "barrier":
+                self.switched.set()
+            return event
+
+        def switch(self):
+            for event in (obs("b", 4), feedback("a", "old"),
+                          {"type": "INPUT", "id": "barrier"}):
+                self.events.put(event)
+
+        def send_output(self, name, values, metadata):
+            self.outputs.append((name, values, metadata))
+            if name == "status" and values[0].as_py() == "ready":
+                start = command("start")
+                start["metadata"]["episode_attempt_id"] = "a"
+                self.events.put(start)
+                self.events.put(obs("stale-before-start", 0))
+                self.events.put(obs("a", 1))
+            elif name == "actions":
+                if metadata["chunk_id"] == "bootstrap":
+                    self.events.put(feedback("a", "bootstrap"))
+                    self.events.put(obs("a", 2))
+                elif metadata["chunk_id"] == "old":
+                    assert switch_at == "waiting-for-adoption"
+                    self.switch()
+                elif metadata["chunk_id"] == "new":
+                    self.events.put(feedback("b", "new"))
+                    self.events.put(feedback("a", "old"))
+                    self.events.put(obs("b", 5))
+                else:
+                    self.events.put({"type": "STOP"})
+
+    node = SwitchingNode()
+    monkeypatch.setattr(bridge.dora, "Node", lambda: node)
+    monkeypatch.setenv("LOCAL_POLICY_TIMING_EVERY", "0")
+    path = str(tmp_path / "task-switch.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(path)
+        listener.listen(1)
+
+        def server():
+            try:
+                conn, _ = listener.accept()
+                conn.settimeout(3)
+                with conn, conn.makefile("rw") as io:
+                    assert json.loads(io.readline()) == {"ping": True}
+                    io.write('{"ready":true,"positions":[]}\n')
+                    io.flush()
+                    for chunk_id in ("bootstrap", "old", "new", "next"):
+                        request = json.loads(io.readline())
+                        requests.append(request)
+                        if chunk_id == "old" and switch_at == "in-flight":
+                            node.switch()
+                            assert node.switched.wait(2)
+                        metadata = {**request["metadata"], "chunk_id": chunk_id,
+                                    "based_on_chunk_id": "", "reset": request["reset"]}
+                        io.write(json.dumps({"positions": [[0.0]*16], "interval": 33_333_333,
+                                             "metadata": metadata}) + '\n')
+                        io.flush()
+                    assert io.readline() == ""
+            except BaseException as exc:
+                failures.append(exc)
+                node.events.put({"type": "STOP"})
+
+        worker = threading.Thread(target=server, daemon=True)
+        worker.start()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            bridge._main_dora(sock, tmp_path, socket_path=path, infer_hz=1000)
+        worker.join(3)
+    assert not worker.is_alive() and not failures
+    assert [r["metadata"]["timestamp"] for r in requests] == [1, 2, 4, 5]
+    assert [r["reset"] for r in requests] == [True, False, True, False]
+    assert requests[2]["execution_plan"] is None
+    assert requests[3]["execution_plan"]["chunk_id"] == "new"
+    outputs = [m for name, _, m in node.outputs if name == "actions"]
+    assert [m["chunk_id"] for m in outputs] == (
+        ["bootstrap", "new", "next"] if switch_at == "in-flight"
+        else ["bootstrap", "old", "new", "next"])

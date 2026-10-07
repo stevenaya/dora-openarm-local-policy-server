@@ -19,6 +19,7 @@ import contextlib
 from dataclasses import dataclass
 import dora
 import json
+import math
 import os
 import pyarrow as pa
 import socket
@@ -316,7 +317,6 @@ def _print_local_timing(
         f"server_ready={_format_ms(timing.get('response_ready_ms'))} "
         f"server_input={_format_ms(timing.get('input_read_ms', timing.get('arrow_read_ms')))} "
         f"server_parse={_format_ms(timing.get('input_parse_ms', timing.get('parse_observations_ms')))} "
-        f"server_rate_wait={_format_ms(timing.get('rate_limit_wait_ms'))} "
         f"server_transport={timing.get('input_transport', 'arrow_file')} "
         f"server_mmap={timing.get('arrow_memory_map', 'NA')}",
         flush=True,
@@ -361,7 +361,7 @@ def _connect_ready(sock, path, timeout, stopped):
 
 
 def _main_dora(
-    sock, shared_dir, *, socket_path, transport="arrow_file", shm_writer=None
+    sock, shared_dir, *, socket_path, transport="arrow_file", shm_writer=None, infer_hz=10.0
 ):
     timing_every = max(0, _env_int("LOCAL_POLICY_TIMING_EVERY", 20))
     arrow_pool_size = (
@@ -383,6 +383,9 @@ def _main_dora(
         "active": False,
         "ready": False,
         "generation": 0,
+        "execution_plan": None,
+        "attempt_id": None,
+        "waiting_chunk": None,
     }
 
     def reader_loop():
@@ -415,7 +418,21 @@ def _main_dora(
                             shared["latest"] = None
                         else:
                             continue
+                        shared["execution_plan"] = None
+                        shared["waiting_chunk"] = None
+                        shared["attempt_id"] = event["metadata"].get("episode_attempt_id")
                         cond.notify_all()
+                    continue
+
+                if event_id == "execution_plan":
+                    with cond:
+                        attempt = event["metadata"].get("episode_attempt_id")
+                        if shared["active"] and attempt == shared["attempt_id"]:
+                            plan = event["value"][0].as_py()
+                            shared["execution_plan"] = plan
+                            if plan and plan.get("sample_chunk_id") == shared["waiting_chunk"]:
+                                shared["waiting_chunk"] = None
+                            cond.notify_all()
                     continue
 
                 if event_id != "observation":
@@ -423,9 +440,25 @@ def _main_dora(
                 with cond:
                     if not shared["active"]:
                         continue
-
-                generation = _update_observation_generation(event["value"], state)
-                with cond:
+                    attempt = event["metadata"].get("episode_attempt_id")
+                    # Start fences the first observation, not all later task attempts.
+                    if (
+                        state["previous_observation_id"] is None
+                        and shared["attempt_id"] is not None and attempt != shared["attempt_id"]
+                    ):
+                        continue
+                    if (
+                        attempt is not None and shared["attempt_id"] is not None
+                        and attempt != shared["attempt_id"]
+                    ):
+                        _start_episode(state)
+                    if attempt is not None:
+                        shared["attempt_id"] = attempt
+                    generation = _update_observation_generation(event["value"], state)
+                    if shared["generation"] != generation:
+                        shared["latest"] = None
+                        shared["execution_plan"] = None
+                        shared["waiting_chunk"] = None
                     shared["generation"] = generation
                     latest = shared["latest"]
                     protected = {
@@ -475,7 +508,7 @@ def _main_dora(
                     return
                 shared["ready"] = True
                 _send_status(node, "ready")
-            _run_requests(node, io, cond, shared, stopped, arrow_pool)
+            _run_requests(node, io, cond, shared, stopped, arrow_pool, infer_hz=infer_hz)
     except Exception as exc:
         error = shared["error"]
         if stopped.is_set() and error is None:
@@ -488,17 +521,25 @@ def _main_dora(
         reader.join()
 
 
-def _run_requests(node, io, cond, shared, stopped, arrow_pool):
+def _run_requests(node, io, cond, shared, stopped, arrow_pool, *, infer_hz=10.0):
     n_keep_data = 5
 
     request_reset = _ResetLatch()
     output_reset = _ResetLatch()
     last_request_sent_ns = None
+    last_submit = None
+    last_submit_generation = None
+    submit_interval = 1.0 / infer_hz
     while True:
         wait_start_ns = time.perf_counter_ns()
         with cond:
-            while shared["latest"] is None and not stopped.is_set():
-                cond.wait()
+            while not stopped.is_set():
+                delay = 0.0
+                if last_submit is not None and shared["generation"] == last_submit_generation:
+                    delay = last_submit + submit_interval - time.monotonic()
+                if shared["latest"] is not None and shared.get("waiting_chunk") is None and delay <= 0:
+                    break
+                cond.wait(timeout=delay if delay > 0 else None)
             if shared["error"] is not None:
                 raise shared["error"]
             if stopped.is_set():
@@ -506,6 +547,7 @@ def _run_requests(node, io, cond, shared, stopped, arrow_pool):
             prepared = shared["latest"]
             shared["latest"] = None
             shared["in_flight_resource"] = prepared.resource
+            prepared.request["execution_plan"] = shared.get("execution_plan")
         wait_done_ns = time.perf_counter_ns()
 
         _serialize_request(
@@ -518,6 +560,8 @@ def _run_requests(node, io, cond, shared, stopped, arrow_pool):
             if last_request_sent_ns is None
             else (send_start_ns - last_request_sent_ns) / 1e6
         )
+        last_submit = time.monotonic()
+        last_submit_generation = prepared.generation
         io.write(prepared.request_json + "\n")
         io.flush()
         request_sent_ns = time.perf_counter_ns()
@@ -539,6 +583,9 @@ def _run_requests(node, io, cond, shared, stopped, arrow_pool):
             dropped_stale = (
                 not shared["active"] or shared["generation"] != prepared.generation
             )
+            metadata = actions.get("metadata", {})
+            if not dropped_stale and actions.get("positions") and "based_on_chunk_id" in metadata:
+                shared["waiting_chunk"] = metadata["chunk_id"]
         if not dropped_stale and _send_actions(
             node,
             actions,
@@ -589,7 +636,13 @@ def main():
         help="The local socket to communicate",
         type=str,
     )
+    parser.add_argument(
+        "--infer-hz", type=float, default=10.0,
+        help="Maximum request submission frequency; wait before selecting latest input",
+    )
     args = parser.parse_args()
+    if not math.isfinite(args.infer_hz) or args.infer_hz <= 0:
+        parser.error("--infer-hz must be positive and finite")
     transport = os.getenv("LOCAL_POLICY_TRANSPORT", "arrow_file").strip().lower()
     if transport == "shm_ring":
         transport = SHM_RING_TRANSPORT
@@ -614,6 +667,7 @@ def main():
                     sock,
                     shared_dir,
                     socket_path=args.socket,
+                    infer_hz=args.infer_hz,
                     transport=transport,
                     shm_writer=shm_writer,
                 )
