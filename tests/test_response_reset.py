@@ -1,4 +1,4 @@
-"""A model-requested restart must not be overwritten by the local reset latch."""
+"""Output forwards the reset already resolved by the caller session."""
 
 import pytest
 
@@ -6,16 +6,10 @@ from dora_openarm_local_policy_server.main import _send_actions
 
 
 @pytest.mark.parametrize(
-    "local_reset,model_reset,expected",
-    [
-        (False, False, False),
-        (False, True, True),
-        (True, False, True),
-        (True, True, True),
-    ],
+    "reset", [False, True],
 )
-def test_execution_reset_is_merged(local_reset, model_reset, expected):
-    """Preserve either reset source without mutating response metadata."""
+def test_execution_reset_is_forwarded(reset):
+    """Preserve the caller's resolved reset without mutating response metadata."""
     outputs = []
 
     class Node:
@@ -26,9 +20,9 @@ def test_execution_reset_is_merged(local_reset, model_reset, expected):
         "positions": [[0.0] * 16],
         "interval": 33_333_333,
         "reset_applied": True,
-        "metadata": {"reset": model_reset, "chunk_id": "one"},
+        "metadata": {"reset": reset, "chunk_id": "one"},
     }
-    assert _send_actions(Node(), response, local_reset)
-    assert outputs[0][2]["reset"] is expected
+    assert _send_actions(Node(), response)
+    assert outputs[0][2]["reset"] is reset
     assert outputs[0][2]["chunk_id"] == "one"
-    assert response["metadata"]["reset"] is model_reset
+    assert response["metadata"]["reset"] is reset

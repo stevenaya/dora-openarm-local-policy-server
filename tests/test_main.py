@@ -9,9 +9,7 @@ import pytest
 
 from dora_openarm_local_policy_server.main import (
     _PreparedRequest,
-    _ResetLatch,
     _new_prepare_state,
-    _response_acknowledges_reset,
     _send_actions,
     _serialize_request,
     _start_episode,
@@ -19,6 +17,7 @@ from dora_openarm_local_policy_server.main import (
     _validate_input_ack,
 )
 from dora_openarm_local_policy_server.shm_ring import SharedMemoryRingWriter
+from dora_openarm_local_policy_server.session import Session
 
 
 def _observation(*ids):
@@ -57,7 +56,6 @@ def _prepared_request(generation):
         event_period_ms=None,
         prepare_input_ms=0.0,
         json_request_ms=0.0,
-        path="observation.arrow",
         reset=False,
         generation=generation,
         should_log_timing=False,
@@ -94,58 +92,41 @@ def test_latest_observation_id_decrease_is_reset_fallback():
 
 
 def test_request_reset_is_consumed_only_after_completed_response():
-    """Writing a request alone must not consume its reset."""
-    latch = _ResetLatch()
-    latch.consume(1)
-
-    assert latch.pending(2)
-    assert latch.pending(2)
-
+    caller = Session()
+    control = caller.prepare(2, {"timestamp":1}, "task")
     prepared = _prepared_request(2)
-    _serialize_request(prepared, latch.pending(prepared.generation))
-
-    assert json.loads(prepared.request_json)["reset"] is True
-    assert latch.pending(2)
-
-    prefill_response = {"positions": [], "reset_applied": True}
-    if prepared.reset and _response_acknowledges_reset(prefill_response):
-        latch.consume(prepared.generation)
-    assert not latch.pending(2)
+    _serialize_request(prepared, control)
+    assert json.loads(prepared.request_json)["reset_reason"] == "request"
+    assert caller.reset_pending
+    caller.complete(control, {"positions":[], "prefill":True, "reset_applied":True,
+                              "interval":1, "generated_timestamp_ns":2})
+    assert not caller.reset_pending and caller.first
 
 
 def test_empty_response_without_ack_keeps_request_reset_pending():
-    """An unprocessed empty response must leave request reset latched."""
-    latch = _ResetLatch(last_generation=1)
+    caller = Session()
+    control = caller.prepare(2, {"timestamp":1}, "task")
     prepared = _prepared_request(2)
-    _serialize_request(prepared, latch.pending(prepared.generation))
-
-    if prepared.reset and _response_acknowledges_reset({"positions": []}):
-        latch.consume(prepared.generation)
-
-    assert latch.pending(2)
+    _serialize_request(prepared, control)
+    caller.complete(control, {"positions":[], "prefill":True, "reset_applied":False,
+                              "interval":1, "generated_timestamp_ns":2})
+    assert caller.reset_pending
 
 
 def test_output_reset_is_consumed_only_after_nonempty_actions():
-    """An empty response must not consume the executor-facing reset."""
-    node = _FakeNode()
-    latch = _ResetLatch()
-
-    empty = {"interval": 1, "positions": []}
-    if _send_actions(node, empty, latch.pending(1)):
-        latch.consume(1)
-    assert latch.pending(1)
-    assert node.outputs == []
-
-    actions = {
-        "interval": 1,
-        "positions": [[1.0, 2.0]],
-        "metadata": {"chunk_id": "chunk-1"},
-    }
-    if _send_actions(node, actions, latch.pending(1)):
-        latch.consume(1)
-    assert not latch.pending(1)
-    assert node.outputs[0][2]["reset"] is True
-    assert node.outputs[0][2]["chunk_id"] == "chunk-1"
+    node, caller = _FakeNode(), Session()
+    control = caller.prepare(1, {"timestamp":1}, "task")
+    result = {"positions":[], "prefill":True, "reset_applied":True,
+              "interval":1, "generated_timestamp_ns":2}
+    empty = caller.complete(control, result)
+    if _send_actions(node, empty):
+        caller.sent(empty)
+    assert caller.first and not node.outputs
+    actions = caller.complete(control, {**result, "positions":[[1.0,2.0]], "prefill":False})
+    if _send_actions(node, actions):
+        caller.sent(actions)
+    assert not caller.first and node.outputs[0][2]["reset"]
+    assert node.outputs[0][2]["chunk_id"] == control["chunk_id"]
 
 
 def test_shm_ring_slot_is_released_only_after_matching_ack():

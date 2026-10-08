@@ -4,11 +4,32 @@ import json
 import queue
 import socket
 import threading
+from types import SimpleNamespace
 
+import numpy as np
+from openarm_policy_runtime import Backend, ModelSession, Prediction
+from openarm_policy_runtime.logging import json_default
 import pyarrow as pa
 import pytest
 
 from dora_openarm_local_policy_server import main as bridge
+from dora_openarm_local_policy_server.shm_ring import SharedMemoryRingWriter
+
+
+def run_bridge(sock, directory, **kwargs):
+    writer = SharedMemoryRingWriter(directory)
+    try:
+        return bridge._main_dora(sock, shm_writer=writer, **kwargs)
+    finally:
+        writer.close()
+
+
+def prediction(request, execution=None):
+    return {"positions": [[0.0] * 16], "interval": 33333333,
+            "generated_timestamp_ns": 100, "execution": execution,
+            "reset_applied": request["reset_reason"] is not None,
+            "input_sequence": request["shm"]["sequence"],
+            "released_input_sequences": [request["shm"]["sequence"]]}
 
 
 def command(value):
@@ -105,7 +126,8 @@ def test_socket_readiness(monkeypatch, tmp_path, mode):
                 with conn, conn.makefile("rw") as io:
                     requests.append(json.loads(io.readline()))
                     io.write(
-                        json.dumps({"ready": mode != "rejected", "positions": []})
+                        json.dumps({"ready": mode != "rejected", "positions": [],
+                                    "input_mode": "copy", "shm_slot_count": 3})
                         + "\n"
                     )
                     io.flush()
@@ -113,7 +135,7 @@ def test_socket_readiness(monkeypatch, tmp_path, mode):
                         requests.append(json.loads(io.readline()))
                         io.write(
                             json.dumps(
-                                {"positions": [[0.0] * 16], "interval": 33333333}
+                                prediction(requests[-1])
                             )
                             + "\n"
                         )
@@ -143,10 +165,10 @@ def test_socket_readiness(monkeypatch, tmp_path, mode):
     worker.start()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         if mode in {"ok", "cancel-in-flight"}:
-            bridge._main_dora(sock, tmp_path, socket_path=path)
+            run_bridge(sock, tmp_path, socket_path=path)
         else:
             with pytest.raises((ConnectionError, RuntimeError)):
-                bridge._main_dora(sock, tmp_path, socket_path=path)
+                run_bridge(sock, tmp_path, socket_path=path)
     worker.join(2)
     assert not worker.is_alive() and not failures
     assert requests[0] == {"ping": True}
@@ -154,12 +176,12 @@ def test_socket_readiness(monkeypatch, tmp_path, mode):
     if mode == "ok":
         assert statuses == ["loading", "ready"]
         assert len(requests) == 2 and requests[1]["metadata"]["timestamp"] == 2
-        assert requests[1]["reset"]
-        assert requests[1]["execution_plan"] == {"chunk_id": "accepted"}
+        assert requests[1]["reset_reason"] == "request"
+        assert requests[1]["execution_plan"] is None  # Restart cannot reuse a prior plan.
         assert node.outputs[-1][0] == "actions" and node.outputs[-1][2]["reset"]
     elif mode == "cancel-in-flight":
         assert statuses == ["loading", "ready"]
-        assert len(requests) == 2 and requests[1]["reset"]
+        assert len(requests) == 2 and requests[1]["reset_reason"] == "request"
         assert not any(name == "actions" for name, _, _ in node.outputs)
     else:
         assert statuses == (
@@ -179,11 +201,11 @@ def test_startup_timeout_or_cancel(monkeypatch, tmp_path, mode):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         if mode == "timeout":
             with pytest.raises(TimeoutError):
-                bridge._main_dora(
+                run_bridge(
                     sock, tmp_path, socket_path=str(tmp_path / "absent.sock")
                 )
         else:
-            bridge._main_dora(sock, tmp_path, socket_path=str(tmp_path / "absent.sock"))
+            run_bridge(sock, tmp_path, socket_path=str(tmp_path / "absent.sock"))
     expected = ["loading", "error"] if mode == "timeout" else ["loading"]
     assert [v[0].as_py() for n, v, _ in node.outputs if n == "status"] == expected
 
@@ -192,6 +214,9 @@ def test_startup_timeout_or_cancel(monkeypatch, tmp_path, mode):
 def test_task_switch_unblocks_rtc_and_discards_old_attempt(monkeypatch, tmp_path, switch_at):
     """A new observation attempt replaces outstanding work or an old ACK wait."""
     requests, failures = [], []
+    ids = iter(("bootstrap", "old", "new", "next"))
+    monkeypatch.setattr("dora_openarm_local_policy_server.session.uuid.uuid4",
+                        lambda: SimpleNamespace(hex=next(ids)))
 
     def obs(attempt, timestamp):
         return {"type": "INPUT", "id": "observation", "value": observation(),
@@ -199,7 +224,8 @@ def test_task_switch_unblocks_rtc_and_discards_old_attempt(monkeypatch, tmp_path
 
     def feedback(attempt, chunk):
         return {"type": "INPUT", "id": "execution_plan",
-                "value": pa.array([{"chunk_id": chunk, "sample_chunk_id": chunk}]),
+                "value": pa.array([{"chunk_id": chunk, "sample_chunk_id": chunk,
+                                    "positions": [[0.0] * 16]}]),
                 "metadata": {"episode_attempt_id": attempt}}
 
     class SwitchingNode(Node):
@@ -254,7 +280,7 @@ def test_task_switch_unblocks_rtc_and_discards_old_attempt(monkeypatch, tmp_path
                 conn.settimeout(3)
                 with conn, conn.makefile("rw") as io:
                     assert json.loads(io.readline()) == {"ping": True}
-                    io.write('{"ready":true,"positions":[]}\n')
+                    io.write('{"ready":true,"input_mode":"copy","shm_slot_count":3}\n')
                     io.flush()
                     for chunk_id in ("bootstrap", "old", "new", "next"):
                         request = json.loads(io.readline())
@@ -262,10 +288,9 @@ def test_task_switch_unblocks_rtc_and_discards_old_attempt(monkeypatch, tmp_path
                         if chunk_id == "old" and switch_at == "in-flight":
                             node.switch()
                             assert node.switched.wait(2)
-                        metadata = {**request["metadata"], "chunk_id": chunk_id,
-                                    "based_on_chunk_id": "", "reset": request["reset"]}
-                        io.write(json.dumps({"positions": [[0.0]*16], "interval": 33_333_333,
-                                             "metadata": metadata}) + '\n')
+                        assert request["chunk_id"] == chunk_id
+                        io.write(json.dumps(prediction(request, {"based_on_chunk_id": "",
+                                                                 "action_window_start": 0})) + '\n')
                         io.flush()
                     assert io.readline() == ""
             except BaseException as exc:
@@ -275,14 +300,122 @@ def test_task_switch_unblocks_rtc_and_discards_old_attempt(monkeypatch, tmp_path
         worker = threading.Thread(target=server, daemon=True)
         worker.start()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            bridge._main_dora(sock, tmp_path, socket_path=path, infer_hz=1000)
+            run_bridge(sock, tmp_path, socket_path=path, infer_hz=1000)
         worker.join(3)
     assert not worker.is_alive() and not failures
     assert [r["metadata"]["timestamp"] for r in requests] == [1, 2, 4, 5]
-    assert [r["reset"] for r in requests] == [True, False, True, False]
+    assert [bool(r["reset_reason"]) for r in requests] == [True, False, True, False]
     assert requests[2]["execution_plan"] is None
     assert requests[3]["execution_plan"]["chunk_id"] == "new"
     outputs = [m for name, _, m in node.outputs if name == "actions"]
     assert [m["chunk_id"] for m in outputs] == (
         ["bootstrap", "new", "next"] if switch_at == "in-flight"
         else ["bootstrap", "old", "new", "next"])
+
+
+def test_borrowed_ring_survives_bursts_and_stale_response(monkeypatch, tmp_path):
+    """Actual bridge/socket/mmap, with delayed model reads and many unsent observations."""
+    consumed, failures, requests, replies = [], [], [], []
+
+    class BorrowBackend(Backend):
+        supports_borrowed_observations = True
+        max_retained_inputs = 2
+
+        def __init__(self):
+            self.held = None
+
+        def check(self):
+            if self.held is not None:
+                obs, expected = self.held
+                np.testing.assert_array_equal(obs.qpos, expected)
+
+        def reset(self, reason):
+            self.check()
+            if self.held is not None:
+                self.held[0].release_input()
+                self.held = None
+            return False
+
+        def predict(self, obs):
+            self.reset("consumed")
+            consumed.append(int(obs.qpos[0, 0]))
+            self.held = obs, obs.qpos.copy()
+            return Prediction(np.zeros((1, 16), dtype=np.float32))
+
+    class BurstingNode(Node):
+        def __init__(self):
+            super().__init__("borrow")
+            self.barrier = threading.Event()
+            self.actions = 0
+
+        def next(self, timeout):
+            event = super().next(timeout)
+            if event.get("id") == "barrier":
+                self.barrier.set()
+            return event
+
+        def observe(self, number, attempt):
+            value = pa.StructArray.from_arrays(
+                [pa.array([number]), pa.array([[float(number)] * 16], type=pa.list_(pa.float32()))],
+                names=["id", "position"],
+            )
+            self.events.put({"type": "INPUT", "id": "observation", "value": value,
+                             "metadata": {"timestamp": number, "episode_attempt_id": attempt}})
+
+        def send_output(self, name, values, metadata):
+            self.outputs.append((name, values, metadata))
+            if name == "status" and values[0].as_py() == "ready":
+                self.events.put(command("start"))
+                self.observe(1, "a")
+            elif name == "actions":
+                self.actions += 1
+                if self.actions == 2:  # The middle reply changes task while in flight.
+                    self.events.put({"type": "STOP"})
+
+    node, backend = BurstingNode(), BorrowBackend()
+    monkeypatch.setattr(bridge.dora, "Node", lambda: node)
+    monkeypatch.setenv("LOCAL_POLICY_TIMING_EVERY", "0")
+    path = str(tmp_path / "borrow.sock")
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(path)
+        listener.listen(1)
+
+        def server():
+            session = ModelSession(backend, borrow_inputs=True)
+            try:
+                conn, _ = listener.accept()
+                conn.settimeout(3)
+                with conn, conn.makefile("rw") as io:
+                    io.write(json.dumps(session.handle(json.loads(io.readline()))) + '\n')
+                    io.flush()
+                    for begin, end, attempt in ((2, 20, "a"), (21, 40, "b"), (41, 60, "b")):
+                        request = json.loads(io.readline())
+                        requests.append(request)
+                        reply = session.handle(request)
+                        replies.append(reply)
+                        node.barrier.clear()
+                        for number in range(begin, end + 1):
+                            node.observe(number, attempt)
+                        node.events.put({"type": "INPUT", "id": "barrier"})
+                        assert node.barrier.wait(2)
+                        backend.check()  # Five slots have wrapped many times; held input is intact.
+                        io.write(json.dumps(reply, default=json_default) + '\n')
+                        io.flush()
+                    assert io.readline() == ""
+            except BaseException as exc:
+                failures.append(exc)
+                node.events.put({"type": "STOP"})
+            finally:
+                session.close()
+
+        worker = threading.Thread(target=server, daemon=True)
+        worker.start()
+        with socket.socket(socket.AF_UNIX) as sock:
+            run_bridge(sock, tmp_path, socket_path=path, infer_hz=50)
+        worker.join(4)
+    assert not worker.is_alive() and not failures
+    assert consumed == [1, 20, 40]
+    assert [r["shm"]["sequence"] for r in requests] == [1, 20, 40]
+    assert all(r["shm"]["slot_count"] == 5 for r in requests)
+    assert [r["released_input_sequences"] for r in replies] == [[], [1], [20]]
+    assert node.actions == 2 and backend.held is None
