@@ -28,7 +28,11 @@ class Session:
         chunk_log_path=None,
         chunk_log_queue_size=0,
         timing_log_every=1,
+        inference_mode="async",
     ):
+        if inference_mode not in {"async", "stop-and-go"}:
+            raise ValueError("inference_mode must be async or stop-and-go")
+        self.stop_and_go = inference_mode == "stop-and-go"
         self.prompt = str(prompt or "")
         self.window_start = int(action_window_start or 0)
         self.window_size = None if action_window_size in (None, "") else int(action_window_size)
@@ -46,10 +50,11 @@ class Session:
             AsyncChunkLogger(chunk_log_path, int(chunk_log_queue_size)) if chunk_log_path else None
         )
 
-    @staticmethod
-    def _validate_window(start, size):
+    def _validate_window(self, start, size):
         if start < 0 or (size is not None and size <= 0):
             raise ValueError("Action window requires start >= 0 and size > 0 (or None)")
+        if self.stop_and_go and start != 0:
+            raise ValueError("stop-and-go requires action window start = 0")
 
     def requires_plan(self, generation, plan):
         """After RTC bootstrap, infer only against an adopted executor plan."""
@@ -84,7 +89,8 @@ class Session:
         elif prompt != self.prompt:
             reason = "prompt"
         elif (
-            self.last_end is not None
+            not self.stop_and_go  # Waiting for execution is intentional in synchronous mode.
+            and self.last_end is not None
             and self.reset_gap is not None
             and time.monotonic() - self.last_end > self.reset_gap
         ):
@@ -94,7 +100,7 @@ class Session:
             "prompt": prompt,
             "reset_reason": reason,
             "restart_execution": self.first,
-            "execution_plan": None if self.first else plan,
+            "execution_plan": None if self.first or self.stop_and_go else plan,
             "chunk_id": uuid.uuid4().hex,
             "record_log": self.chunk_log is not None,
         }
@@ -111,7 +117,9 @@ class Session:
         self.first |= bool(result.get("restart_execution"))
         prefill = result.get("prefill", False)
         execution = result.get("execution") or {}
-        start = 0 if self.first else int(execution.get("action_window_start", self.window_start))
+        if self.stop_and_go and "based_on_chunk_id" in execution:
+            raise ValueError("stop-and-go requires RTC disabled in the model")
+        start = 0 if self.first or self.stop_and_go else int(execution.get("action_window_start", self.window_start))
         full = result["positions"]
         if not prefill:
             start = min(start, len(full) - 1)
@@ -131,6 +139,8 @@ class Session:
         }
         if not prefill:
             metadata["chunk_id"] = request["chunk_id"]
+        if self.stop_and_go:
+            metadata["inference_mode"] = "stop-and-go"
         response = {
             "positions": selected,
             "interval": result["interval"],

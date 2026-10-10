@@ -10,6 +10,7 @@ import pyarrow as pa
 
 from openarm_policy_runtime import ModelSession
 from .session import Session, launch_options
+from .execution import accept_execution_plan, fresh_observation, reset_execution, wait_for_execution
 
 
 class LatestInput:
@@ -23,6 +24,8 @@ class LatestInput:
         self.execution_plan = None
         self.attempt_id = None
         self.waiting_chunk = None
+        self.stop_and_go = False
+        self.observation_after_ns = None
 
     def accept(self, event):
         received_ns = time.time_ns()
@@ -37,21 +40,15 @@ class LatestInput:
                 elif command in {"stop", "intervene", "quit"}:
                     self.active = False
                     self.latest = None
-                self.execution_plan = None
-                self.waiting_chunk = None
+                else:
+                    return
+                reset_execution(vars(self))
                 self.attempt_id = event["metadata"].get("episode_attempt_id")
                 self.condition.notify_all()
                 return
             if event["id"] == "execution_plan":
-                attempt = event["metadata"].get("episode_attempt_id")
-                if self.active and attempt == self.attempt_id:
-                    self.execution_plan = event["value"][0].as_py()
-                    if (
-                        self.execution_plan
-                        and self.execution_plan.get("sample_chunk_id") == self.waiting_chunk
-                    ):
-                        self.waiting_chunk = None
-                    self.condition.notify_all()
+                accept_execution_plan(vars(self), event)
+                self.condition.notify_all()
                 return
             if event["id"] != "observation" or not self.ready or not self.active:
                 return
@@ -69,11 +66,12 @@ class LatestInput:
             )
             if task_changed or (self.previous_id is not None and observation_id < self.previous_id):
                 self.generation += 1
-                self.execution_plan = None
-                self.waiting_chunk = None
+                reset_execution(vars(self))
             if attempt is not None:
                 self.attempt_id = attempt
             self.previous_id = observation_id
+            if not fresh_observation(vars(self), event["metadata"]):
+                return
             # Keeping the Arrow event retains Dora's allocation, including its drop notification.
             self.latest = (self.generation, event, received_ns)
             self.condition.notify_all()
@@ -170,6 +168,7 @@ def serve_dora(
     reader.start()
     try:
         session = Session(**options)
+        state.stop_and_go = session.stop_and_go
         backend = backend_factory()
         if borrow_inputs and not backend.supports_borrowed_observations:
             raise ValueError(f"Backend {backend.name} does not support --borrow-inputs")
@@ -239,8 +238,7 @@ def serve_dora(
                     )
                     if "cutoff_hz" in response:
                         metadata["cutoff_hz"] = response["cutoff_hz"]
-                    if "based_on_chunk_id" in metadata:
-                        state.waiting_chunk = metadata["chunk_id"]
+                    wait_for_execution(vars(state), metadata)
                     node.send_output(
                         "actions",
                         pa.array(response["positions"], type=pa.list_(pa.float32())),

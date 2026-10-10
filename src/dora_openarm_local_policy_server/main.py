@@ -33,6 +33,9 @@ from dora_openarm_local_policy_server.shm_ring import (
     SharedMemoryRingWriter,
 )
 from dora_openarm_local_policy_server.session import Session, launch_options
+from dora_openarm_local_policy_server.execution import (
+    accept_execution_plan, fresh_observation, reset_execution, wait_for_execution,
+)
 
 
 START_COMMANDS = {"start"}
@@ -278,6 +281,8 @@ def _main_dora(
         "execution_plan": None,
         "attempt_id": None,
         "waiting_chunk": None,
+        "stop_and_go": session.stop_and_go,
+        "observation_after_ns": None,
     }
 
     def reader_loop():
@@ -310,21 +315,15 @@ def _main_dora(
                             shared["latest"] = None
                         else:
                             continue
-                        shared["execution_plan"] = None
-                        shared["waiting_chunk"] = None
+                        reset_execution(shared)
                         shared["attempt_id"] = event["metadata"].get("episode_attempt_id")
                         cond.notify_all()
                     continue
 
                 if event_id == "execution_plan":
                     with cond:
-                        attempt = event["metadata"].get("episode_attempt_id")
-                        if shared["active"] and attempt == shared["attempt_id"]:
-                            plan = event["value"][0].as_py()
-                            shared["execution_plan"] = plan
-                            if plan and plan.get("sample_chunk_id") == shared["waiting_chunk"]:
-                                shared["waiting_chunk"] = None
-                            cond.notify_all()
+                        accept_execution_plan(shared, event)
+                        cond.notify_all()
                     continue
 
                 if event_id != "observation":
@@ -349,9 +348,10 @@ def _main_dora(
                     generation = _update_observation_generation(event["value"], state)
                     if shared["generation"] != generation:
                         shared["latest"] = None
-                        shared["execution_plan"] = None
-                        shared["waiting_chunk"] = None
+                        reset_execution(shared)
                     shared["generation"] = generation
+                    if not fresh_observation(shared, event["metadata"]):
+                        continue
                     latest = shared["latest"]
                     protected = {
                         shared["in_flight_resource"],
@@ -367,7 +367,8 @@ def _main_dora(
                     protected,
                 )
                 with cond:
-                    if shared["active"] and shared["generation"] == generation:
+                    if (shared["active"] and shared["generation"] == generation
+                            and fresh_observation(shared, prepared.request["metadata"])):
                         shared["latest"] = prepared
                         cond.notify()
         except BaseException as exc:
@@ -479,8 +480,8 @@ def _run_requests(node, io, cond, shared, stopped, session, *, infer_hz=10.0):
             if not dropped_stale:
                 actions = session.complete(control, result)
                 metadata = actions["metadata"]
-                if actions["positions"] and "based_on_chunk_id" in metadata:
-                    shared["waiting_chunk"] = metadata["chunk_id"]
+                if actions["positions"]:
+                    wait_for_execution(shared, metadata)
                 if _send_actions(node, actions):
                     session.sent(actions)
         loop_done_ns = time.perf_counter_ns()
