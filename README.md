@@ -14,6 +14,15 @@ In the workspace, use `launch_inference.sh experiment.yaml` with the fixed
 `openarm-policy-entry` dataflow node. Install the node together with the local
 `packages/openarm-policy-runtime` source package; it is not assumed to be on PyPI.
 
+## Optional independent state history
+
+An observer may supply a small `state_history` matrix at a separate cadence from
+camera history. The bridge packs it once, preserving existing image/position
+rows, scheduling and action-window behavior. The shared reader exposes an owned
+`Observation.state_history` even when images are borrowed. See the
+[optional state-history wire contract](docs/serving.md#optional-independently-sampled-state-history).
+Legacy observations without this field remain unchanged.
+
 ## Synchronous stop-and-go
 
 Set `policy.args.inference-mode: stop-and-go` in the workspace experiment YAML

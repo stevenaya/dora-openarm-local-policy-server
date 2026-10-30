@@ -57,6 +57,33 @@ There is no extra ACK channel, completion polling, or fixed-round expiry.
 Socket Arrow files remain removed. Native Dora still uses Arrow, optionally borrowed
 without a bulk input copy. Its allocation lifetime is managed by Arrow ownership.
 
+### Optional independently sampled state history
+
+The bridge also accepts the observer's optional `state_history` field. Camera
+fields and legacy `position` keep their existing row count. The new Arrow field
+has type `list<list<float32>>`: only the current image row contains a complete
+state-history matrix, and all other rows are null. For example, five image/qpos
+rows can accompany seven state rows without transmitting seven copies of images.
+
+`shm_ring.py` validates and packs the matrix once as the independent descriptor
+entry `fields.state_history` (`<f4`, shape `[state_rows,dof]`). The normal metadata
+forwarding carries `state_history_delta_indices`, `state_history_hz`, and
+`state_history_timestamps`; all three are required when the matrix is present.
+Offsets must be unique/increasing/nonpositive and end at zero. Timestamps must
+be chronological and causal, end at the observation timestamp, and have one
+entry per state row; duplicated startup timestamps are allowed. The final state
+must equal the current legacy position row. Null/ragged/non-finite matrices,
+wrong dimensions, and partial metadata are rejected before publication.
+
+The shared runtime exposes the result as `Observation.state_history` and
+`Observation.state_history_delta_indices`. This matrix is always an owned copy,
+including in borrow mode; camera/legacy-qpos borrowing and release rules are
+unchanged. The caller does not resample states or alter pacing, action windows,
+execution-plan feedback, or completion handling for this extension. Old payloads
+without the field retain their prior layout and behavior. The first observation
+must include the configured layout so the fixed SHM slot capacity is sufficient
+for later requests.
+
 `OPENARM_POLICY_SESSION` is JSON with `infer_hz`, `prompt`, `action_window_start`,
 `action_window_size`, `reset_gap`, `chunk_log_path`, `chunk_log_queue_size`, and
 `timing_log_every`. The workspace launcher constructs it from existing YAML

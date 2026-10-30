@@ -6,6 +6,7 @@ import os
 import tempfile
 
 import numpy as np
+from openarm_policy_runtime.transport import state_history_from_arrow
 
 
 SHM_RING_TRANSPORT = "shm_ring_v1"
@@ -66,6 +67,10 @@ def _observation_arrays(observation, metadata):
             "position",
         )
     }
+    state_history = state_history_from_arrow(observation, metadata, arrays["position"])
+    if state_history is not None:
+        # Independent state cadence; do not repeat the matrix for every image.
+        arrays["state_history"] = state_history
     for name in _CAMERA_FIELDS:
         if name not in field_names:
             continue
